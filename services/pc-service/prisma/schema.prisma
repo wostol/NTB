@@ -1,36 +1,39 @@
+// services/pc-service/prisma/schema.prisma
+
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
+
+// ===== ТАБЛИЦЫ ОТ AUTH-SERVICE (игнорируем полностью) =====
+// ⚠️ Никаких связей с другими моделями! Только @@ignore
 
 model Role {
   role_id   Int      @id @default(autoincrement())
   role_name String   @unique @db.VarChar(50)
-  users     User[]
+  @@map("roles")
+  @@ignore
 }
 
 model User {
-  user_id       Int          @id @default(autoincrement())
-  username      String       @unique @db.VarChar(50)
-  full_name     String       @db.VarChar(100)
-  email         String?      @unique @db.VarChar(100)
-  role_id       Int
-  is_active     Boolean      @default(true)
-  created_at    DateTime     @default(now())
-  last_login    DateTime?
-
-  role          Role         @relation(fields: [role_id], references: [role_id])
-  bookings      Booking[]
-  sessions      Session[]
-  favorites     Favorite[]
-  filters       Filter[]
-  audit_logs    AuditLog[]
-  waiting_list  WaitingList[]
+  user_id    Int      @id @default(autoincrement())
+  username   String   @unique @db.VarChar(50)
+  full_name  String   @db.VarChar(100)
+  email      String?  @unique @db.VarChar(100)
+  role_id    Int
+  is_active  Boolean  @default(true)
+  created_at DateTime @default(now())
+  last_login DateTime?
+  @@map("users")
+  @@ignore
 }
+
+// ===== ТАБЛИЦЫ, КОТОРЫМИ УПРАВЛЯЕТ PC-SERVICE =====
+// ⚠️ user_id — просто Int, БЕЗ @relation к User
 
 model Computer {
   computer_id      Int              @id @default(autoincrement())
@@ -40,20 +43,21 @@ model Computer {
   status           String           @db.VarChar(20) @default("available")
   last_maintenance DateTime?
 
-  // Связь 1:1. Внешний ключ хранится в PcConfiguration
-  config           PcConfiguration?
+  config           PcConfiguration? @relation
 
   bookings         Booking[]
   sessions         Session[]
   waiting_list     WaitingList[]
   favorites        Favorite[]
   pc_software      PcSoftware[]
+
+  @@map("computers")
 }
 
 model PcConfiguration {
   id            Int      @id @default(autoincrement())
   computer_id   Int      @unique
-  computer      Computer @relation(fields: [computer_id], references: [computer_id])
+  computer      Computer @relation(fields: [computer_id], references: [computer_id], onDelete: Cascade)
 
   cpu           String?  @db.VarChar(100)
   ram_gb        Int?
@@ -63,6 +67,8 @@ model PcConfiguration {
   os            String?  @db.VarChar(50)
   monitor       String?  @db.VarChar(50)
   notes         String?  @db.Text
+
+  @@map("pc_configurations")
 }
 
 model Software {
@@ -74,6 +80,8 @@ model Software {
   description   String?      @db.Text
   created_at    DateTime     @default(now())
   pc_software   PcSoftware[]
+
+  @@map("software")
 }
 
 model PcSoftware {
@@ -81,15 +89,16 @@ model PcSoftware {
   software_id    Int
   installed_date DateTime @default(now())
 
-  computer       Computer @relation(fields: [pc_id], references: [computer_id])
-  software       Software @relation(fields: [software_id], references: [id])
+  computer       Computer @relation(fields: [pc_id], references: [computer_id], onDelete: Cascade)
+  software       Software @relation(fields: [software_id], references: [id], onDelete: Cascade)
 
   @@id([pc_id, software_id])
+  @@map("pc_software")
 }
 
 model Booking {
   booking_id    Int       @id @default(autoincrement())
-  user_id       Int
+  user_id       Int       // ✅ Просто число из JWT, без связи с User
   computer_id   Int
   booking_date  DateTime
   start_time    DateTime
@@ -101,14 +110,15 @@ model Booking {
   cancelled_at  DateTime?
   notes         String?   @db.Text
 
-  user          User      @relation(fields: [user_id], references: [user_id])
-  computer      Computer  @relation(fields: [computer_id], references: [computer_id])
+  computer      Computer  @relation(fields: [computer_id], references: [computer_id], onDelete: Cascade)
   sessions      Session[]
+
+  @@map("bookings")
 }
 
 model Session {
   session_id  Int       @id @default(autoincrement())
-  user_id     Int
+  user_id     Int       // ✅ Просто число из JWT
   computer_id Int
   booking_id  Int
   start_time  DateTime
@@ -116,14 +126,15 @@ model Session {
   status      String    @db.VarChar(20)
   created_at  DateTime  @default(now())
 
-  user        User      @relation(fields: [user_id], references: [user_id])
-  computer    Computer  @relation(fields: [computer_id], references: [computer_id])
-  booking     Booking   @relation(fields: [booking_id], references: [booking_id])
+  computer    Computer  @relation(fields: [computer_id], references: [computer_id], onDelete: Cascade)
+  booking     Booking   @relation(fields: [booking_id], references: [booking_id], onDelete: Cascade)
+
+  @@map("sessions")
 }
 
 model WaitingList {
   id                   Int       @id @default(autoincrement())
-  user_id              Int
+  user_id              Int       // ✅ Просто число из JWT
   computer_id          Int
   desired_start_time   DateTime?
   priority             Int       @default(0)
@@ -131,34 +142,35 @@ model WaitingList {
   notified             Boolean   @default(false)
   expires_at           DateTime?
 
-  user                 User      @relation(fields: [user_id], references: [user_id])
-  computer             Computer  @relation(fields: [computer_id], references: [computer_id])
+  computer             Computer  @relation(fields: [computer_id], references: [computer_id], onDelete: Cascade)
+
+  @@map("waiting_list")
 }
 
 model Favorite {
-  user_id     Int
+  user_id     Int       // ✅ Просто число из JWT
   computer_id Int
   created_at  DateTime @default(now())
 
-  user        User     @relation(fields: [user_id], references: [user_id])
-  computer    Computer @relation(fields: [computer_id], references: [computer_id])
+  computer    Computer @relation(fields: [computer_id], references: [computer_id], onDelete: Cascade)
 
   @@id([user_id, computer_id])
+  @@map("favorites")
 }
 
 model Filter {
   filter_id             Int      @id @default(autoincrement())
-  user_id               Int
+  user_id               Int       // ✅ Просто число из JWT
   config_requirements   Json?
   software_requirements Json?
   created_at            DateTime @default(now())
 
-  user                  User     @relation(fields: [user_id], references: [user_id])
+  @@map("filters")
 }
 
 model AuditLog {
   log_id      BigInt   @id @default(autoincrement())
-  user_id     Int?
+  user_id     Int?      // ✅ Опционально, без связи с User
   action      String   @db.VarChar(100)
   entity_type String   @db.VarChar(50)
   entity_id   Int?
@@ -167,5 +179,5 @@ model AuditLog {
   ip_address  String?  @db.VarChar(50)
   created_at  DateTime @default(now())
 
-  user        User?    @relation(fields: [user_id], references: [user_id])
+  @@map("audit_logs")
 }
