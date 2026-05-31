@@ -1,0 +1,60 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+
+model User {
+  user_id   Int      @id
+  favorites Favorite[]
+  filters   Filter[]
+  
+  @@map("users")
+}
+
+model Computer {
+  computer_id Int            @id
+  favorites   Favorite[]
+  config      PcConfiguration?
+  
+  @@map("computers")  
+}
+
+model PcConfiguration {
+  id          Int      @id
+  computer_id Int      @unique
+  computer    Computer @relation(fields: [computer_id], references: [computer_id])
+  
+  @@map("pcconfigurations")
+}
+
+
+model Favorite {
+  user_id     Int
+  computer_id Int
+  created_at  DateTime @default(now())
+
+  user        User     @relation(fields: [user_id], references: [user_id])
+  computer    Computer @relation(fields: [computer_id], references: [computer_id])
+
+  // Составной первичный ключ: один юзер не может добавить один ПК дважды
+  @@id([user_id, computer_id])
+  
+  @@map("favorites")  
+}
+
+model Filter {
+  filter_id             Int      @id @default(autoincrement())
+  user_id               Int
+  config_requirements   Json?
+  software_requirements Json?
+  created_at            DateTime @default(now())
+
+  user                  User     @relation(fields: [user_id], references: [user_id])
+
+  @@map("filters")  
+}
