@@ -1,67 +1,171 @@
 // src/pages/admin/Dashboard.jsx
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import axios from 'axios';
 
-//  Моковые данные (заменишь на API позже)
-const MOCK_STATS = {
-  totalPcs: 24,
-  availablePcs: 8,
-  activeBookings: 12,
-  totalUsers: 156,
-  todayBookings: 18,
-  cancelledToday: 2,
+// ===== Базовые URL из .env или дефолты =====
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
+const PCS_API = import.meta.env.VITE_PCS_API_URL || 'http://localhost:3002/api';
+const AUDIT_API = import.meta.env.VITE_AUDIT_API_URL || 'http://localhost:3004/api';
+const BOOKINGS_API = import.meta.env.VITE_BOOKINGS_API_URL || 'http://localhost:3003/api';
+
+// ===== Хелпер для авторизованных запросов =====
+const api = (baseURL) => {
+  const instance = axios.create({ baseURL });
+  instance.interceptors.request.use((config) => {
+    const token = localStorage.getItem('jwt_token');
+    if (token) config.headers.Authorization = `Bearer ${token}`;
+    return config;
+  });
+  return instance;
 };
 
-const MOCK_RECENT_ACTIVITY = [
-  { id: 1, action: 'CREATE_BOOKING', user: 'Иванов Иван', computer: 'PC-005', time: '10:45', status: 'success' },
-  { id: 2, action: 'CANCEL_BOOKING', user: 'Петров Петр', computer: 'PC-012', time: '10:30', status: 'warning' },
-  { id: 3, action: 'USER_LOGIN', user: 'Сидорова Анна', computer: '-', time: '10:15', status: 'info' },
-  { id: 4, action: 'PC_MAINTENANCE', user: 'Администратор', computer: 'PC-003', time: '09:50', status: 'neutral' },
-  { id: 5, action: 'CREATE_BOOKING', user: 'Козлов Дмитрий', computer: 'PC-008', time: '09:30', status: 'success' },
-];
-
-const MOCK_CHART_DATA = [
-  { hour: '08:00', value: 4 },
-  { hour: '10:00', value: 12 },
-  { hour: '12:00', value: 18 },
-  { hour: '14:00', value: 22 },
-  { hour: '16:00', value: 15 },
-  { hour: '18:00', value: 6 },
-];
+const pcs = api(PCS_API);
+const audit = api(AUDIT_API);
+const auth = api(API_BASE);
+const bookings = api(BOOKINGS_API);
 
 export default function Dashboard() {
-  const [stats, setStats] = useState(MOCK_STATS);
-  const [activity, setActivity] = useState(MOCK_RECENT_ACTIVITY);
-  const [chartData] = useState(MOCK_CHART_DATA);
+  const [stats, setStats] = useState({
+    totalPcs: 0, availablePcs: 0, activeBookings: 0, totalUsers: 0,
+    todayBookings: 0, cancelledToday: 0, loading: true
+  });
+  const [activity, setActivity] = useState([]);
+  const [chartData, setChartData] = useState([]);
+  const [error, setError] = useState(null);
   const navigate = useNavigate();
 
-  // Имитация загрузки
+  // Загрузка всех данных
   useEffect(() => {
-    // Здесь будет: api.get('/admin/stats').then(setStats)
+    const loadData = async () => {
+      try {
+        setError(null);
+        const token = localStorage.getItem('jwt_token');
+        if (!token) return;
+
+        // 1. Статистика по ПК (из pc-service)
+        const pcsRes = await pcs.get('/pcs');
+        const allPcs = pcsRes.data;
+        const availablePcs = allPcs.filter(pc => pc.status === 'available').length;
+
+        // 2. Статистика по броням — ✅ ИСПРАВЛЕНО: считаем ВСЕ активные брони
+        // Сначала получаем ВСЕ активные брони (без фильтра по дате) для счётчика
+        const allActiveRes = await bookings.get('/bookings', {
+          params: { status: 'active', limit: 1000 }
+        });
+        const allActiveBookings = allActiveRes.data.bookings || allActiveRes.data || [];
+        const activeBookingsCount = allActiveBookings.length;
+
+        // Отдельно: брони на сегодня (для графика и статистики "сегодня")
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const todayBookingsRes = await bookings.get('/bookings', {
+          params: { date: today.toISOString().split('T')[0], limit: 100 }
+        });
+        const todayBookings = todayBookingsRes.data.bookings || todayBookingsRes.data || [];
+        const cancelledToday = todayBookings.filter(b => b.status === 'cancelled').length;
+
+        // 3. Количество пользователей (только админ)
+        let totalUsers = 0;
+        try {
+          const usersRes = await auth.get('/admin/users', { params: { limit: 1 } });
+          totalUsers = usersRes.data.pagination?.total || 0;
+        } catch {
+          totalUsers = 0;
+        }
+
+        setStats({
+          totalPcs: allPcs.length,
+          availablePcs,
+          activeBookings: activeBookingsCount,  // ✅ Теперь показывает ВСЕ активные брони
+          totalUsers,
+          todayBookings: todayBookings.length,
+          cancelledToday,
+          loading: false
+        });
+
+        // 4. График: бронирования по часам сегодня (оставляем как было)
+        const hourly = {};
+        todayBookings.forEach(b => {
+          const hour = new Date(b.start_time).getHours();
+          const key = `${hour.toString().padStart(2, '0')}:00`;
+          hourly[key] = (hourly[key] || 0) + 1;
+        });
+        const chart = Object.entries(hourly)
+          .map(([hour, value]) => ({ hour, value }))
+          .sort((a, b) => a.hour.localeCompare(b.hour));
+        setChartData(chart.length ? chart : [{ hour: '08:00', value: 0 }]);
+
+        // 5. Последние события из аудита
+        const auditRes = await audit.get('/audit', { params: { limit: 5 } });
+        const logs = auditRes.data.logs || [];
+        setActivity(logs.map(log => ({
+          id: log.log_id,
+          action: log.action,
+          user: log.user_name || `User #${log.user_id}`,
+          computer: log.entity_type === 'Computer' ? `PC #${log.entity_id}` : 
+                   log.entity_type === 'Booking' ? `Booking #${log.entity_id}` : '-',
+          time: new Date(log.created_at).toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' }),
+          status: log.action.includes('CREATE') ? 'success' :
+                  log.action.includes('CANCEL') ? 'warning' :
+                  log.action.includes('LOGIN') ? 'info' : 'neutral'
+        })));
+
+      } catch (err) {
+        console.error('❌ Dashboard load error:', err);
+        setError('Не удалось загрузить данные');
+        setStats(prev => ({ ...prev, loading: false }));
+      }
+    };
+
+    loadData();
+    // Автообновление каждые 60 секунд
+    const interval = setInterval(loadData, 60000);
+    return () => clearInterval(interval);
   }, []);
 
   const getActionIcon = (action) => {
     switch(action) {
-      case 'CREATE_BOOKING': return '🟢';
-      case 'CANCEL_BOOKING': return '🔴';
-      case 'USER_LOGIN': return '🔵';
-      case 'PC_MAINTENANCE': return '🟡';
+      case 'BOOKING_CREATED': return '🟢';
+      case 'BOOKING_CANCELLED': return '🔴';
+      case 'USER_LOGGED_IN': return '🔵';
+      case 'PC_CREATED': case 'PC_UPDATED': return '🟡';
+      case 'USER_REGISTERED': return '🟣';
       default: return '⚪';
     }
   };
 
   const getActionText = (action) => {
     switch(action) {
-      case 'CREATE_BOOKING': return 'Создал бронь';
-      case 'CANCEL_BOOKING': return 'Отменил бронь';
-      case 'USER_LOGIN': return 'Вошёл в систему';
-      case 'PC_MAINTENANCE': return 'Обслуживание ПК';
-      default: return action;
+      case 'BOOKING_CREATED': return 'Создал бронь';
+      case 'BOOKING_CANCELLED': return 'Отменил бронь';
+      case 'BOOKING_UPDATED': return 'Обновил бронь';
+      case 'USER_LOGGED_IN': return 'Вошёл в систему';
+      case 'USER_REGISTERED': return 'Зарегистрировался';
+      case 'PC_CREATED': return 'Добавил ПК';
+      case 'PC_UPDATED': return 'Обновил ПК';
+      case 'PC_DELETED': return 'Удалил ПК';
+      default: return action.replace(/_/g, ' ').toLowerCase();
     }
   };
 
-  // Простой расчет высоты для "графика"
-  const maxValue = Math.max(...chartData.map(d => d.value));
+  if (stats.loading) {
+    return <div style={{ padding: 40, textAlign: 'center', color: '#64748b' }}>Загрузка панели...</div>;
+  }
+
+  if (error) {
+    return (
+      <div style={{ padding: 40, textAlign: 'center' }}>
+        <div style={{ color: '#dc2626', marginBottom: 16 }}>❌ {error}</div>
+        <button onClick={() => window.location.reload()} style={{
+          padding: '8px 16px', background: '#3b82f6', color: 'white',
+          border: 'none', borderRadius: 6, cursor: 'pointer'
+        }}>🔄 Попробовать снова</button>
+      </div>
+    );
+  }
+
+  const maxValue = chartData.length ? Math.max(...chartData.map(d => d.value), 1) : 1;
 
   return (
     <div>
@@ -117,27 +221,7 @@ export default function Dashboard() {
         gap: 24,
         marginBottom: 32
       }}>
-        {/* Мини-график */}
-        <div style={{ background: 'white', borderRadius: 12, padding: 20, border: '1px solid #e2e8f0' }}>
-          <h3 style={{ margin: '0 0 16px', fontSize: '1.1rem', color: '#0f172a' }}>📈 Загрузка сегодня</h3>
-          <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8, height: 120 }}>
-            {chartData.map((item, idx) => (
-              <div key={idx} style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', flex: 1 }}>
-                <div 
-                  style={{
-                    width: '100%',
-                    height: `${(item.value / maxValue) * 100}%`,
-                    background: 'linear-gradient(180deg, #3b82f6, #60a5fa)',
-                    borderRadius: '4px 4px 0 0',
-                    transition: 'height 0.3s'
-                  }}
-                  title={`${item.value} броней`}
-                />
-                <span style={{ fontSize: '0.7rem', color: '#64748b', marginTop: 4 }}>{item.hour}</span>
-              </div>
-            ))}
-          </div>
-        </div>
+        
 
         {/* Последние события */}
         <div style={{ background: 'white', borderRadius: 12, padding: 20, border: '1px solid #e2e8f0' }}>
@@ -151,7 +235,9 @@ export default function Dashboard() {
             </button>
           </div>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-            {activity.map(item => (
+            {activity.length === 0 ? (
+              <div style={{ textAlign: 'center', color: '#64748b', padding: '20px 0' }}>Нет недавних событий</div>
+            ) : activity.map(item => (
               <div 
                 key={item.id}
                 style={{ 
@@ -169,7 +255,7 @@ export default function Dashboard() {
                   </div>
                   {item.computer !== '-' && (
                     <div style={{ fontSize: '0.85rem', color: '#64748b' }}>
-                      Компьютер: <strong>{item.computer}</strong>
+                      {item.action.includes('PC') ? 'Компьютер' : 'Бронь'}: <strong>{item.computer}</strong>
                     </div>
                   )}
                 </div>
@@ -207,7 +293,8 @@ export default function Dashboard() {
   );
 }
 
-//  Вспомогательный компонент: карточка статистики
+// ===== Вспомогательные компоненты =====
+
 function StatCard({ title, value, icon, color, onClick }) {
   return (
     <div 
@@ -239,7 +326,6 @@ function StatCard({ title, value, icon, color, onClick }) {
   );
 }
 
-//  Вспомогательный компонент: кнопка действия
 function ActionButton({ label, onClick, primary }) {
   return (
     <button

@@ -3,6 +3,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { UserHome, MyBookings, UserProfile } from './pages/user';
+import Favorites from './pages/user/Favorites'; // ✅ ИМПОРТ НОВОЙ СТРАНИЦЫ
 
 // Layouts
 import AdminLayout from './components/Layout/AdminLayout';
@@ -124,6 +125,7 @@ export default function App() {
               <ProtectedRoute allowedRoles={[1, 2]}><UserLayout /></ProtectedRoute>
             }>
               <Route index element={<UserHome />} />
+              <Route path="favorites" element={<Favorites />} /> {/* ✅ НОВЫЙ МАРШРУТ! */}
               <Route path="bookings" element={<MyBookings />} />
               <Route path="profile" element={<UserProfile />} />
             </Route>

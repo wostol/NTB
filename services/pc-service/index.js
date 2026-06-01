@@ -1,4 +1,5 @@
 // services/pc-service/index.js
+const { publishAuditEvent } = require('../lib/audit');
 const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
@@ -40,9 +41,9 @@ const requireAdmin = (req, res, next) => {
 // Health check
 app.get('/health', (req, res) => res.json({ status: 'ok', service: 'pc-service' }));
 
-// ===== 🖥️ КОМПЬЮТЕРЫ =====
+// ===== 🖥️ КОМПЬЮТЕРЫ — ЕДИНСТВЕННЫЕ МАРШРУТЫ В ЭТОМ СЕРВИСЕ =====
 
-// Список
+// Список компьютеров
 app.get('/api/pcs', authenticateToken, async (req, res) => {
   try {
     const { status, floor, search } = req.query;
@@ -65,7 +66,7 @@ app.get('/api/pcs', authenticateToken, async (req, res) => {
   }
 });
 
-// Один ПК
+// Один компьютер
 app.get('/api/pcs/:id', authenticateToken, async (req, res) => {
   try {
     const computer = await prisma.computer.findUnique({
@@ -79,7 +80,7 @@ app.get('/api/pcs/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Создать (админ)
+// Создать компьютер (админ) — ✅ С АУДИТОМ
 app.post('/api/pcs', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { serial_number, floor, room, config } = req.body;
@@ -92,6 +93,17 @@ app.post('/api/pcs', authenticateToken, requireAdmin, async (req, res) => {
         config: config ? { create: config } : undefined
       }, include: { config: true }
     });
+    
+    publishAuditEvent('pc.created', {
+      event: 'pc.created',
+      user_id: req.user?.userId,
+      entity_type: 'Computer',
+      entity_id: computer.computer_id,
+      new_value: { serial_number, floor, room, config },
+      service: 'pc-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
+    
     res.status(201).json(computer);
   } catch (error) {
     console.error('❌ Create PC error:', error);
@@ -100,26 +112,51 @@ app.post('/api/pcs', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// Обновить (админ)
+// Обновить компьютер (админ) — ✅ С АУДИТОМ
 app.put('/api/pcs/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
     const { floor, room, status, config } = req.body;
     const computerId = parseInt(req.params.id);
+    
+    const oldComputer = await prisma.computer.findUnique({ 
+      where: { computer_id: computerId },
+      include: { config: true }
+    });
+    
     const computer = await prisma.computer.update({
       where: { computer_id: computerId },
       data: {
-        floor: floor !== undefined ? parseInt(floor) : undefined, room, status
-      }, include: { config: true }
+        floor: floor !== undefined ? parseInt(floor) : undefined, 
+        room, 
+        status
+      }, 
+      include: { config: true }
     });
+    
     if (config) {
       await prisma.pcConfiguration.upsert({
         where: { computer_id: computerId },
-        update: config, create: { computer_id: computerId, ...config }
+        update: config, 
+        create: { computer_id: computerId, ...config }
       });
     }
+    
     const updated = await prisma.computer.findUnique({
-      where: { computer_id: computerId }, include: { config: true }
+      where: { computer_id: computerId }, 
+      include: { config: true }
     });
+    
+    publishAuditEvent('pc.updated', {
+      event: 'pc.updated',
+      user_id: req.user?.userId,
+      entity_type: 'Computer',
+      entity_id: computerId,
+      old_value: { serial_number: oldComputer?.serial_number, floor: oldComputer?.floor, room: oldComputer?.room, status: oldComputer?.status },
+      new_value: { serial_number: updated?.serial_number, floor: updated?.floor, room: updated?.room, status: updated?.status },
+      service: 'pc-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
+    
     res.json(updated);
   } catch (error) {
     console.error('❌ Update PC error:', error);
@@ -128,198 +165,83 @@ app.put('/api/pcs/:id', authenticateToken, requireAdmin, async (req, res) => {
   }
 });
 
-// Удалить (админ)
+// 🗑️ Удалить компьютер (админ) — ✅ С КАСКАДНЫМ УДАЛЕНИЕМ ЗАВИСИМОСТЕЙ
 app.delete('/api/pcs/:id', authenticateToken, requireAdmin, async (req, res) => {
   try {
-    await prisma.computer.delete({ where: { computer_id: parseInt(req.params.id) } });
-    res.json({ message: 'Computer deleted successfully' });
-  } catch (error) {
-    console.error('❌ Delete PC error:', error);
-    if (error.code === 'P2025') return res.status(404).json({ error: 'Computer not found' });
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ===== 📅 БРОНИРОВАНИЯ =====
-
-// Список (админ — все, юзер — свои) — ✅ БЕЗ include: { user }
-app.get('/api/bookings', authenticateToken, async (req, res) => {
-  try {
-    const { user_id, computer_id, status, date, page = 1, limit = 20 } = req.query;
-    const isAdmin = req.user?.roleId === 2;
-    const where = {};
-    if (!isAdmin) where.user_id = req.user?.userId;
-    if (user_id && isAdmin) where.user_id = parseInt(user_id);
-    if (computer_id) where.computer_id = parseInt(computer_id);
-    if (status && status !== 'all') where.status = status;
-    if (date) {
-      const start = new Date(date);
-      const end = new Date(date); end.setHours(23, 59, 59, 999);
-      where.start_time = { gte: start, lte: end };
-    }
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    const take = parseInt(limit);
-    const [bookings, total] = await Promise.all([
-      prisma.booking.findMany({
-        where, skip, take, orderBy: { start_time: 'desc' },
-        include: {
-          // ❌ УБРАЛИ user — модель игнорируется в этом сервисе
-          computer: { select: { computer_id: true, serial_number: true, floor: true, room: true } }
-        }
-      }),
-      prisma.booking.count({ where })
-    ]);
-    res.json({ bookings, pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / limit) } });
-  } catch (error) {
-    console.error('❌ Get bookings error:', error);
-    res.status(500).json({ error: 'Failed to fetch bookings' });
-  }
-});
-
-// Создать бронь — ✅ БЕЗ include: { user }
-app.post('/api/bookings', authenticateToken, async (req, res) => {
-  try {
-    const { computer_id, start_time, end_time, purpose, booking_type, user_id: bodyUserId } = req.body;
+    const computerId = parseInt(req.params.id);
     
-    // 🔐 Определяем ID пользователя
-    let userId;
-    if (req.user?.roleId === 2 && bodyUserId) {
-      userId = parseInt(bodyUserId);
-    } else {
-      userId = req.user?.userId;
-    }
+    // 1. Сначала находим компьютер для аудита
+    const computer = await prisma.computer.findUnique({ 
+      where: { computer_id: computerId },
+      include: { config: true }
+    });
     
-    // ✅ Валидация userId
-    if (!userId || isNaN(userId)) {
-      return res.status(400).json({ error: 'Invalid user: cannot determine user_id' });
-    }
-    
-    // ✅ Проверка: компьютер
-    if (!computer_id) {
-      return res.status(400).json({ error: 'computer_id is required' });
-    }
-    const computer = await prisma.computer.findUnique({ where: { computer_id: parseInt(computer_id) } });
     if (!computer) {
       return res.status(404).json({ error: 'Computer not found' });
     }
     
-    // ✅ Проверка: даты
-    const startDate = new Date(start_time);
-    const endDate = new Date(end_time);
-    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-      return res.status(400).json({ error: 'Invalid date format' });
-    }
-    if (endDate <= startDate) {
-      return res.status(400).json({ error: 'End time must be after start time' });
-    }
+    // 2. ✅ Удаляем связанные записи в правильном порядке:
     
-    // ✅ Проверка: конфликты
-    const conflict = await prisma.booking.findFirst({
-      where: {
-        computer_id: parseInt(computer_id),
-        status: { in: ['active', 'confirmed', 'pending'] },
-        OR: [
-          { start_time: { lte: endDate, gte: startDate } },
-          { end_time: { gte: startDate, lte: endDate } }
-        ]
-      }
+    // Сначала удаляем конфигурацию ПК (если есть)
+    await prisma.pcConfiguration.deleteMany({
+      where: { computer_id: computerId }
     });
-    if (conflict) {
-      return res.status(409).json({ error: 'This time slot is already booked' });
-    }
     
-    // ✅ Создаём бронь — БЕЗ include: { user }
-    const booking = await prisma.booking.create({
-      data: {
-        user_id: userId,
-        computer_id: parseInt(computer_id),
-        start_time: startDate,
-        end_time: endDate,
-        status: 'active',
-        purpose: purpose || null,
-        booking_type: booking_type || 'standard',
-        booking_date: new Date()
+    // Удаляем все бронирования этого ПК (из booking-service)
+    await prisma.booking.deleteMany({
+      where: { computer_id: computerId }
+    });
+    
+    // Удаляем записи в избранном (из preferences-service)
+    await prisma.favorite.deleteMany({
+      where: { computer_id: computerId }
+    });
+    
+    // 3. Теперь удаляем сам компьютер
+    await prisma.computer.delete({ 
+      where: { computer_id: computerId } 
+    });
+    
+    console.log(`✅ PC deleted: ${computerId}`);
+    
+    // 📤 Публикуем событие в аудит
+    publishAuditEvent('pc.deleted', {
+      event: 'pc.deleted',
+      user_id: req.user?.userId,
+      entity_type: 'Computer',
+      entity_id: computerId,
+      old_value: { 
+        serial_number: computer?.serial_number, 
+        floor: computer?.floor, 
+        room: computer?.room,
+        config: computer?.config
       },
-      include: {
-        // ❌ УБРАЛИ user — модель игнорируется в этом сервисе
-        computer: { select: { computer_id: true, serial_number: true, floor: true, room: true } }
-      }
-    });
+      service: 'pc-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
     
-    console.log(`✅ Booking created: ${booking.booking_id} for user ${userId}`);
-    res.status(201).json(booking);
+    res.json({ message: 'Computer deleted successfully' });
     
   } catch (error) {
-    console.error('❌ Create booking error:', error);
+    console.error('❌ Delete PC error:', error);
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Computer not found' });
+    }
     if (error.code === 'P2003') {
-      return res.status(400).json({ error: 'Invalid user_id or computer_id (does not exist in database)' });
+      return res.status(400).json({ 
+        error: 'Cannot delete: related records exist. Please delete configurations/bookings first.',
+        constraint: error.meta?.constraint 
+      });
     }
-    if (error.code === 'P2002') {
-      return res.status(409).json({ error: 'Conflict with existing booking' });
-    }
-    res.status(500).json({ error: 'Failed to create booking' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Обновить бронь — ✅ БЕЗ include: { user }
-app.patch('/api/bookings/:id', authenticateToken, async (req, res) => {
-  try {
-    const bookingId = parseInt(req.params.id);
-    const { status, start_time, end_time, purpose, notes } = req.body;
-    const isAdmin = req.user?.roleId === 2;
-    const booking = await prisma.booking.findUnique({ where: { booking_id: bookingId } });
-    if (!booking) return res.status(404).json({ error: 'Booking not found' });
-    if (!isAdmin && booking.user_id !== req.user?.userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    const updated = await prisma.booking.update({
-      where: { booking_id: bookingId },
-      data: {
-        status: status || booking.status,
-        start_time: start_time ? new Date(start_time) : undefined,
-        end_time: end_time ? new Date(end_time) : undefined,
-        purpose: purpose !== undefined ? purpose : undefined,
-        notes: notes !== undefined ? notes : undefined
-      },
-      include: {
-        // ❌ УБРАЛИ user
-        computer: { select: { computer_id: true, serial_number: true, floor: true, room: true } }
-      }
-    });
-    console.log(`✅ Booking updated: ${bookingId}`);
-    res.json(updated);
-  } catch (error) {
-    console.error('❌ Update booking error:', error);
-    if (error.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Invalid token' });
-    res.status(500).json({ error: 'Failed to update booking' });
-  }
-});
-
-// Отменить/удалить бронь
-app.delete('/api/bookings/:id', authenticateToken, async (req, res) => {
-  try {
-    const bookingId = parseInt(req.params.id);
-    const isAdmin = req.user?.roleId === 2;
-    const booking = await prisma.booking.findUnique({ where: { booking_id: bookingId } });
-    if (!booking) return res.status(404).json({ error: 'Booking not found' });
-    if (!isAdmin && booking.user_id !== req.user?.userId) {
-      return res.status(403).json({ error: 'Access denied' });
-    }
-    await prisma.session.deleteMany({ where: { booking_id: bookingId } });
-    await prisma.booking.delete({ where: { booking_id: bookingId } });
-    console.log(`✅ Booking deleted: ${bookingId}`);
-    res.json({ message: 'Booking cancelled successfully' });
-  } catch (error) {
-    console.error('❌ Delete booking error:', error);
-    if (error.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Invalid token' });
-    if (error.code === 'P2025') return res.status(404).json({ error: 'Booking not found' });
-    res.status(500).json({ error: 'Failed to cancel booking' });
-  }
-});
+// ===== ⚠️ ВСЕ МАРШРУТЫ /api/bookings УДАЛЕНЫ — ОНИ ТЕПЕРЬ В booking-service =====
 
 // ===== ЗАПУСК =====
 app.listen(PORT, () => {
-  console.log(`🖥️  PC Service running on http://localhost:${PORT}`);
+  console.log(`🖥️  PC Service running on http://localhost:${PORT} (только компьютеры)`);
 });
 
 process.on('SIGINT', async () => {

@@ -13,8 +13,6 @@ export default function Sidebar() {
 
   return (
     <aside className="sidebar">
-      
-
       <div className="sidebar-logo">
         NTB Booking {isAdminUser ? '👑' : '👤'}
       </div>
@@ -33,6 +31,7 @@ export default function Sidebar() {
           // === ПОЛЬЗОВАТЕЛЬ МЕНЮ ===
           <>
             <NavLink to="/user" end className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}>🏠 Главная</NavLink>
+            <NavLink to="/user/favorites" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}>❤️ Избранное</NavLink> {/* ✅ НОВОЕ! */}
             <NavLink to="/user/bookings" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}>📋 Мои брони</NavLink>
             <NavLink to="/user/profile" className={({ isActive }) => isActive ? "nav-link active" : "nav-link"}>👤 Профиль</NavLink>
           </>

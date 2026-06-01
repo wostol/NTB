@@ -1,13 +1,21 @@
 // services/audit-service/index.js
 const express = require('express');
+const cors = require('cors');
 const amqp = require('amqplib');
 const { PrismaClient } = require('@prisma/client');
 require('dotenv').config();
+
+// 🔧 FIX: Сериализация BigInt для JSON (Prisma использует BigInt для log_id)
+if (typeof BigInt.prototype.toJSON === 'undefined') {
+  BigInt.prototype.toJSON = function() { return Number(this); };
+}
 
 const prisma = new PrismaClient();
 const app = express();
 const PORT = process.env.PORT || 3004;
 
+// ===== MIDDLEWARE =====
+app.use(cors());
 app.use(express.json());
 
 // Health check
@@ -15,67 +23,100 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'audit-service' });
 });
 
-// ===== RABBITMQ CONSUMER =====
+// 📋 GET /api/audit — список логов (только админ)
+app.get('/api/audit', async (req, res) => {
+  try {
+    const jwt = require('jsonwebtoken');
+    
+    const authHeader = req.headers.authorization;
+    if (!authHeader?.startsWith('Bearer ')) return res.status(401).json({ error: 'Token required' });
+    
+    const token = authHeader.split(' ')[1];
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_key');
+    if (decoded.roleId !== 2) return res.status(403).json({ error: 'Admin access required' });
+
+    const { action, entity_type, page = 1, limit = 50 } = req.query;
+    const where = {};
+    if (action && action !== 'all') where.action = action;
+    if (entity_type && entity_type !== 'all') where.entity_type = entity_type;
+    
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const take = parseInt(limit);
+    
+    const [logs, total] = await Promise.all([
+      prisma.auditLog.findMany({
+        where, skip, take, orderBy: { created_at: 'desc' }
+      }),
+      prisma.auditLog.count({ where })
+    ]);
+    
+    res.json({ logs, pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / limit) } });
+  } catch (error) {
+    console.error('❌ Get audit logs error:', error);
+    if (error.name === 'JsonWebTokenError' || error.name === 'TokenExpiredError') {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    res.status(500).json({ error: 'Failed to fetch audit logs' });
+  }
+});
+
+// ===== 🔄 RABBITMQ CONSUMER =====
 async function startConsumer() {
   try {
-    const conn = await amqp.connect(process.env.RABBITMQ_URL);
+    const conn = await amqp.connect(process.env.RABBITMQ_URL || 'amqp://guest:guest@localhost:5672');
     const channel = await conn.createChannel();
 
-    // Создаем exchange и очередь (если еще нет)
     await channel.assertExchange('booking_events', 'topic', { durable: true });
     const q = await channel.assertQueue('audit_queue', { durable: true });
-    
-    // Подписываемся на все события бронирования
-    await channel.bindQueue(q.queue, 'booking_events', 'booking.#');
+    await channel.bindQueue(q.queue, 'booking_events', '#');
 
-    console.log('📥 Audit Service: Listening to booking.# events...');
+    console.log('📥 Audit Service: Listening to all events...');
 
     channel.consume(q.queue, async (msg) => {
       if (msg) {
-        const event = JSON.parse(msg.content.toString());
-        console.log(` Received: ${event.event} for booking #${event.booking_id}`);
-
         try {
-          // Сохраняем в auditlog
-          await prisma.auditlog.create({
+          const event = JSON.parse(msg.content.toString());
+          console.log(`📥 Received: ${event.event}`);
+
+          await prisma.auditLog.create({
             data: {
               user_id: event.user_id || null,
-              action: event.event === 'booking.created' ? 'CREATE_BOOKING' : 'CANCEL_BOOKING',
-              entity_type: 'booking',
-              entity_id: event.booking_id,
-              new_value: event, // Сохраняем полное событие как JSON
-              ip_address: '127.0.0.1', // В проде брать из req.ip
-              created_at: new Date(event.timestamp || Date.now())
+              action: event.action || event.event?.toUpperCase().replace('.', '_') || 'UNKNOWN',
+              entity_type: event.entity_type || 'unknown',
+              entity_id: event.entity_id || null,
+              old_value: event.old_value || null,
+              new_value: event.new_value || event,
+              ip_address: event.ip_address || '127.0.0.1',
+              created_at: event.timestamp ? new Date(event.timestamp) : new Date()
             }
           });
 
-          console.log(`✅ Audit log saved for booking #${event.booking_id}`);
-          channel.ack(msg); // Подтверждаем обработку
+          console.log(`✅ Audit log saved: ${event.event}`);
+          channel.ack(msg);
+          
         } catch (err) {
           console.error('❌ Failed to save audit log:', err.message);
-          channel.nack(msg); // Возвращаем в очередь при ошибке
+          // 🔑 КРИТИЧНО: ack вместо nack, чтобы не зацикливать очередь
+          channel.ack(msg);
         }
       }
     });
 
-    // Обработка разрыва соединения
     conn.on('close', () => {
-      console.warn('🔌 RabbitMQ connection closed. Reconnecting in 5s...');
+      console.warn('🔌 RabbitMQ disconnected. Reconnecting in 5s...');
       setTimeout(startConsumer, 5000);
     });
 
   } catch (err) {
-    console.error('RabbitMQ connection error:', err.message);
+    console.error('❌ RabbitMQ connection error:', err.message);
     setTimeout(startConsumer, 5000);
   }
 }
 
-// Запускаем consumer
-startConsumer();
-
-// Запускаем Express
+// Запуск
 app.listen(PORT, () => {
-  console.log(` Audit Service running on http://localhost:${PORT}`);
+  console.log(`🔍 Audit Service running on http://localhost:${PORT}`);
+  startConsumer();
 });
 
 // Graceful shutdown

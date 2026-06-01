@@ -11,7 +11,29 @@ export function AuthProvider({ children }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
 
-  // Проверка сессии при загрузке
+  // 🔁 Обновление данных пользователя (для профиля и других компонентов)
+  const refreshUser = useCallback(async () => {
+    try {
+      const token = localStorage.getItem('jwt_token');
+      if (!token) return null;
+      
+      const res = await axios.get(`${API_URL}/auth/me`, {
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      setUser(res.data);
+      return res.data;
+    } catch (err) {
+      console.error('❌ Failed to refresh user:', err);
+      // Если токен протух — разлогиним пользователя
+      if (err.response?.status === 401) {
+        localStorage.removeItem('jwt_token');
+        setUser(null);
+      }
+      throw err;
+    }
+  }, []);
+
+  // Проверка сессии при загрузке приложения
   useEffect(() => {
     let isMounted = true;
     const token = localStorage.getItem('jwt_token');
@@ -24,6 +46,7 @@ export function AuthProvider({ children }) {
         if (isMounted) setUser(res.data);
       })
       .catch(() => {
+        // Токен невалиден — чистим
         localStorage.removeItem('jwt_token');
       })
       .finally(() => {
@@ -52,6 +75,10 @@ export function AuthProvider({ children }) {
     setError(null);
     const res = await axios.post(`${API_URL}/auth/register`, userData);
     // Бэкенд возвращает { message, token, user }
+    if (res.data.token) {
+      localStorage.setItem('jwt_token', res.data.token);
+      setUser(res.data.user);
+    }
     return res.data;
   }, []);
 
@@ -59,6 +86,7 @@ export function AuthProvider({ children }) {
   const logout = useCallback(() => {
     localStorage.removeItem('jwt_token');
     setUser(null);
+    // Используем navigate через окно, чтобы не тянуть router в хук
     window.location.href = '/login';
   }, []);
 
@@ -72,11 +100,12 @@ export function AuthProvider({ children }) {
       user, 
       loading, 
       error, 
-      setError,      // ✅ Добавляем для прямого доступа
+      setError,      // ✅ Для прямого доступа из компонентов
       login, 
       register, 
       logout, 
-      clearError 
+      clearError,
+      refreshUser    // ✅ НОВОЕ: обновление данных пользователя
     }}>
       {children}
     </AuthContext.Provider>

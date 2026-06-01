@@ -17,4 +17,6 @@ model AuditLog {
   new_value   Json?
   ip_address  String?  @db.VarChar(50)
   created_at  DateTime @default(now())
+
+  @@map("audit_logs")
 }

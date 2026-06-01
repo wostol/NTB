@@ -49,7 +49,7 @@ const createProxy = (context, target, serviceName) => createProxyMiddleware({
 app.use(createProxy('/api/auth', 'http://localhost:3001', 'Auth'));
 app.use(createProxy('/api/pcs', 'http://localhost:3002', 'PC'));
 app.use(createProxy('/api/bookings', 'http://localhost:3003', 'Booking'));
-
+app.use(createProxy('/api/preferences', 'http://localhost:3005', 'Preferences'));
 // 4️⃣ BodyParser ПОСЛЕ прокси (для остальных маршрутов)
 app.use(express.json({ limit: '10mb' }));
 

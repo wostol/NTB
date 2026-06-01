@@ -1,0 +1,52 @@
+// services/preferences-service/prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ✅ User — из auth-service (маленькая)
+model User {
+  user_id   Int      @id
+  favorites Favorite[]
+  filters   Filter[]
+  @@map("users")  // ← МАЛЕНЬКАЯ!
+}
+
+// ✅ Остальные — как в БД (большая)
+model Computer {
+  computer_id Int            @id
+  favorites   Favorite[]
+  config      PcConfiguration?
+  @@map("Computer")  // ← БОЛЬШАЯ!
+}
+
+model PcConfiguration {
+  id          Int      @id
+  computer_id Int      @unique
+  computer    Computer @relation(fields: [computer_id], references: [computer_id])
+  @@map("PcConfiguration")  // ← БОЛЬШАЯ!
+}
+
+model Favorite {
+  user_id     Int
+  computer_id Int
+  created_at  DateTime @default(now())
+  user        User     @relation(fields: [user_id], references: [user_id])
+  computer    Computer @relation(fields: [computer_id], references: [computer_id])
+  @@id([user_id, computer_id])
+  @@map("Favorite")  // ← БОЛЬШАЯ!
+}
+
+model Filter {
+  filter_id             Int      @id @default(autoincrement())
+  user_id               Int
+  config_requirements   Json?
+  software_requirements Json?
+  created_at            DateTime @default(now())
+  user                  User     @relation(fields: [user_id], references: [user_id])
+  @@map("Filter")  // ← БОЛЬШАЯ!
+}

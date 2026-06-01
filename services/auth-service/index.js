@@ -1,4 +1,5 @@
 // services/auth-service/index.js
+const { publishAuditEvent } = require('../lib/audit'); // ✅ Утилита аудита
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -37,7 +38,27 @@ const checkAdminToken = (req, res) => {
   }
 };
 
-// ===== РЕГИСТРАЦИЯ =====
+// 🔐 Проверка токена для обычных пользователей
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Token required' });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_key');
+    req.user = {
+      userId: decoded.userId || decoded.user_id,
+      username: decoded.username,
+      roleId: decoded.roleId || decoded.role_id,
+      full_name: decoded.full_name,
+      email: decoded.email
+    };
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// ===== РЕГИСТРАЦИЯ — ✅ С АУДИТОМ =====
 app.post('/api/auth/register', async (req, res) => {
   try {
     console.log('📝 Registration request:', req.body);
@@ -76,6 +97,18 @@ app.post('/api/auth/register', async (req, res) => {
     );
 
     console.log('✅ User registered:', user.username);
+    
+    // 🔊 ОТПРАВЛЯЕМ СОБЫТИЕ В AUDIT
+    publishAuditEvent('user.registered', {
+      event: 'user.registered',
+      user_id: user.user_id,
+      entity_type: 'User',
+      entity_id: user.user_id,
+      new_value: { username: user.username, email: user.email, role_id: user.role_id },
+      service: 'auth-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
+    
     res.status(201).json({ 
       message: 'User registered successfully', 
       token,
@@ -90,7 +123,7 @@ app.post('/api/auth/register', async (req, res) => {
   }
 });
 
-// ===== ЛОГИН =====
+// ===== ЛОГИН — ✅ С АУДИТОМ =====
 app.post('/api/auth/login', async (req, res) => {
   try {
     console.log('🔐 Login request:', req.body);
@@ -132,6 +165,18 @@ app.post('/api/auth/login', async (req, res) => {
     );
 
     console.log('✅ Login successful:', username);
+    
+    // 🔊 ОТПРАВЛЯЕМ СОБЫТИЕ В AUDIT
+    publishAuditEvent('user.logged_in', {
+      event: 'user.logged_in',
+      user_id: user.user_id,
+      entity_type: 'User',
+      entity_id: user.user_id,
+      new_value: { username: user.username, role_id: user.role_id, last_login: new Date() },
+      service: 'auth-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
+    
     res.json({
       message: 'Login successful',
       token,
@@ -151,17 +196,10 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ===== ПОЛУЧЕНИЕ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ =====
-app.get('/api/auth/me', async (req, res) => {
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
   try {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No token provided' });
-    }
-    const token = authHeader.split(' ')[1];
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'dev_secret_key');
-
     const user = await prisma.user.findUnique({
-      where: { user_id: decoded.userId },
+      where: { user_id: req.user.userId },
       select: {
         user_id: true,
         username: true,
@@ -189,9 +227,81 @@ app.get('/api/auth/me', async (req, res) => {
   }
 });
 
+// ===== ✏️ PATCH /api/auth/me — Обновить профиль текущего пользователя — ✅ С АУДИТОМ =====
+app.patch('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const { full_name, email } = req.body;
+    
+    // Проверяем, что есть что обновлять
+    if (!full_name && !email) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    // Сохраняем старые значения для аудита
+    const currentUser = await prisma.user.findUnique({
+      where: { user_id: userId },
+      select: { full_name: true, email: true }
+    });
+
+    // Если меняем email — проверяем уникальность
+    if (email) {
+      const existing = await prisma.user.findFirst({
+        where: { email, NOT: { user_id: userId } }
+      });
+      if (existing) {
+        return res.status(409).json({ error: 'Email already exists' });
+      }
+    }
+
+    // Собираем данные для обновления
+    const updateData = {};
+    if (full_name) updateData.full_name = full_name;
+    if (email) updateData.email = email;
+
+    // Обновляем в БД
+    const updated = await prisma.user.update({
+      where: { user_id: userId },
+      data: updateData,
+      select: {
+        user_id: true,
+        username: true,
+        full_name: true,
+        email: true,
+        role_id: true,
+        is_active: true,
+        created_at: true,
+        last_login: true
+      }
+    });
+
+    console.log(`✅ Profile updated for user ${userId}`);
+    
+    // 🔊 ОТПРАВЛЯЕМ СОБЫТИЕ В AUDIT
+    publishAuditEvent('user.profile_updated', {
+      event: 'user.profile_updated',
+      user_id: userId,
+      entity_type: 'User',
+      entity_id: userId,
+      old_value: { full_name: currentUser?.full_name, email: currentUser?.email },
+      new_value: { full_name: updated.full_name, email: updated.email },
+      service: 'auth-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
+    
+    res.json(updated);
+    
+  } catch (error) {
+    console.error('❌ Update profile error:', error);
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: 'Email already exists' });
+    }
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
 // ===== 📋 GET /api/admin/users — Список пользователей (только админ) =====
 app.get('/api/admin/users', async (req, res) => {
-  // 🔐 Проверка токена и роли
   const authCheck = checkAdminToken(req, res);
   if (authCheck?.error) return;
   
@@ -238,9 +348,8 @@ app.get('/api/admin/users', async (req, res) => {
   }
 });
 
-// ===== ✏️ PATCH /api/admin/users/:id/toggle-status — Блок/разблок =====
+// ===== ✏️ PATCH /api/admin/users/:id/toggle-status — Блок/разблок — ✅ С АУДИТОМ =====
 app.patch('/api/admin/users/:id/toggle-status', async (req, res) => {
-  // 🔐 Проверка токена и роли
   const authCheck = checkAdminToken(req, res);
   if (authCheck?.error) return;
   
@@ -256,6 +365,19 @@ app.patch('/api/admin/users/:id/toggle-status', async (req, res) => {
     });
     
     console.log(`✅ User ${updated.username} status toggled: ${updated.is_active}`);
+    
+    // 🔊 ОТПРАВЛЯЕМ СОБЫТИЕ В AUDIT
+    publishAuditEvent('user.status_changed', {
+      event: 'user.status_changed',
+      user_id: req.user?.userId || userId,
+      entity_type: 'User',
+      entity_id: userId,
+      old_value: { is_active: user.is_active },
+      new_value: { is_active: updated.is_active },
+      service: 'auth-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
+    
     res.json(updated);
   } catch (error) {
     console.error('❌ Toggle status error:', error);
@@ -264,32 +386,60 @@ app.patch('/api/admin/users/:id/toggle-status', async (req, res) => {
   }
 });
 
-// ===== 🗑️ DELETE /api/admin/users/:id — Удалить пользователя =====
+// ===== 🗑️ DELETE /api/admin/users/:id — Удалить пользователя — ✅ БЕЗОПАСНОЕ УДАЛЕНИЕ =====
+// 🗑️ DELETE /api/admin/users/:id — Удалить пользователя (МАКСИМАЛЬНО ПРОСТО)
 app.delete('/api/admin/users/:id', async (req, res) => {
-  // 🔐 Проверка токена и роли
   const authCheck = checkAdminToken(req, res);
   if (authCheck?.error) return;
   
   try {
     const userId = parseInt(req.params.id);
     
-    // Удаляем связанные записи (чтобы не было конфликта внешних ключей)
-    await prisma.booking.deleteMany({ where: { user_id: userId } });
-    await prisma.session.deleteMany({ where: { user_id: userId } });
-    await prisma.favorite.deleteMany({ where: { user_id: userId } });
-    await prisma.waitingList.deleteMany({ where: { user_id: userId } });
-    await prisma.filter.deleteMany({ where: { user_id: userId } });
+    // 1. Находим пользователя для аудита
+    const userToDelete = await prisma.user.findUnique({ 
+      where: { user_id: userId },
+      select: { user_id: true, username: true, email: true }
+    });
     
-    // Удаляем самого пользователя
+    if (!userToDelete) return res.status(404).json({ error: 'User not found' });
+    
+    // 2. ✅ Просто пытаемся удалить пользователя — БД сама проверит внешние ключи
     await prisma.user.delete({ where: { user_id: userId } });
     
     console.log(`✅ User deleted: ${userId}`);
+    
+    // 3. 🔊 Отправляем событие в аудит
+    publishAuditEvent('user.deleted', {
+      event: 'user.deleted',
+      user_id: req.user?.userId || userId,
+      entity_type: 'User',
+      entity_id: userId,
+      old_value: { username: userToDelete.username, email: userToDelete.email },
+      service: 'auth-service',
+      ip_address: req.ip || req.headers['x-forwarded-for'] || '127.0.0.1'
+    }).catch(err => console.error('❌ Audit publish failed:', err));
+    
     res.json({ message: 'User deleted successfully' });
+    
   } catch (error) {
     console.error('❌ Delete user error:', error);
-    if (error.name === 'JsonWebTokenError') return res.status(401).json({ error: 'Invalid token' });
-    if (error.code === 'P2025') return res.status(404).json({ error: 'User not found' });
-    res.status(500).json({ error: 'Failed to delete user' });
+    
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({ error: 'Invalid token' });
+    }
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    // ❗ Если есть связанные записи — сообщаем админу, что нужно удалить их вручную
+    if (error.code === 'P2003') {
+      return res.status(400).json({ 
+        error: 'Cannot delete user: related records exist in other tables (bookings, favorites, sessions, etc.)',
+        hint: 'Delete related records first or enable CASCADE in schema.prisma',
+        constraint: error.meta?.constraint 
+      });
+    }
+    
+    res.status(500).json({ error: error.message || 'Failed to delete user' });
   }
 });
 

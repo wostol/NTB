@@ -2,59 +2,187 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
+import axios from 'axios';
 
-// 🔧 Моковые данные компьютеров
-const MOCK_COMPUTERS = [
-  { computer_id: 1, serial_number: 'PC-001', floor: 1, room: '101', status: 'available', config: { cpu: 'Intel i5', ram: '16GB', gpu: 'GTX 1650' } },
-  { computer_id: 2, serial_number: 'PC-002', floor: 1, room: '101', status: 'booked', config: { cpu: 'Intel i7', ram: '32GB', gpu: 'RTX 3060' } },
-  { computer_id: 3, serial_number: 'PC-003', floor: 2, room: '205', status: 'available', config: { cpu: 'AMD Ryzen 5', ram: '16GB', gpu: 'RX 6600' } },
-  { computer_id: 4, serial_number: 'PC-004', floor: 2, room: '205', status: 'maintenance', config: { cpu: 'Intel i3', ram: '8GB', gpu: 'Integrated' } },
-  { computer_id: 5, serial_number: 'PC-005', floor: 3, room: '310', status: 'available', config: { cpu: 'Intel i7', ram: '32GB', gpu: 'RTX 4070' } },
-  { computer_id: 6, serial_number: 'PC-006', floor: 3, room: '310', status: 'available', config: { cpu: 'AMD Ryzen 7', ram: '64GB', gpu: 'RTX 4080' } },
-];
+// ===== Базовые URL из .env =====
+const PCS_API_URL = import.meta.env.VITE_PCS_API_URL || 'http://localhost:3002/api';
+const BOOKINGS_API_URL = import.meta.env.VITE_BOOKINGS_API_URL || 'http://localhost:3003/api'; // ✅ НОВОЕ!
+const PREFS_API_URL = import.meta.env.VITE_PREFS_API_URL || 'http://localhost:3005/api';
+
+// ===== Хелпер для запросов к PC-service (только чтение компьютеров) =====
+const pcsApi = axios.create({ baseURL: PCS_API_URL });
+pcsApi.interceptors.request.use((config) => {
+  const token = localStorage.getItem('jwt_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// ✅ Хелпер для запросов к Booking-service (бронирования)
+const bookingsApi = axios.create({ baseURL: BOOKINGS_API_URL });
+bookingsApi.interceptors.request.use((config) => {
+  const token = localStorage.getItem('jwt_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// ===== Хелпер для запросов к Preferences-service (избранное) =====
+const prefsApi = axios.create({ baseURL: PREFS_API_URL });
+prefsApi.interceptors.request.use((config) => {
+  const token = localStorage.getItem('jwt_token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// ===== Компонент кнопки-сердечка =====
+function HeartButton({ computer_id, onToggle }) {
+  const [isFavorite, setIsFavorite] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await prefsApi.get('/preferences/favorites');
+        const found = res.data.some(pc => pc.computer_id === computer_id);
+        setIsFavorite(found);
+      } catch {
+        setIsFavorite(false);
+      } finally {
+        setLoading(false);
+      }
+    };
+    check();
+  }, [computer_id]);
+
+  const toggle = async (e) => {
+    e.stopPropagation();
+    try {
+      if (isFavorite) {
+        await prefsApi.delete(`/preferences/favorites/${computer_id}`);
+      } else {
+        await prefsApi.post('/preferences/favorites', { computer_id });
+      }
+      setIsFavorite(!isFavorite);
+      if (onToggle) onToggle(computer_id, !isFavorite);
+    } catch (err) {
+      console.error('❌ Favorite toggle error:', err);
+      alert('Не удалось обновить избранное');
+    }
+  };
+
+  if (loading) return <span style={{ cursor: 'wait', fontSize: '1.2rem' }}>⏳</span>;
+
+  return (
+    <button
+      onClick={toggle}
+      title={isFavorite ? 'Убрать из избранного' : 'Добавить в избранное'}
+      style={{
+        background: 'none',
+        border: 'none',
+        cursor: 'pointer',
+        fontSize: '1.3rem',
+        padding: '4px 8px',
+        transition: 'transform 0.1s',
+        color: isFavorite ? '#ef4444' : '#cbd5e1',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+      }}
+      onMouseOver={e => e.currentTarget.style.transform = 'scale(1.2)'}
+      onMouseOut={e => e.currentTarget.style.transform = 'scale(1)'}
+    >
+      {isFavorite ? '❤️' : '🤍'}
+    </button>
+  );
+}
 
 export default function UserHome() {
   const [computers, setComputers] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [filterFloor, setFilterFloor] = useState('all');
   const [filterStatus, setFilterStatus] = useState('available');
   const [selectedPc, setSelectedPc] = useState(null);
   const [bookingTime, setBookingTime] = useState({ start: '', end: '' });
+  const [bookingLoading, setBookingLoading] = useState(false);
   
   const { user } = useAuth();
   const navigate = useNavigate();
 
-  // Загрузка данных
+  // Загрузка компьютеров с бэкенда (через pc-service, порт 3002)
   useEffect(() => {
-    setTimeout(() => {
-      setComputers(MOCK_COMPUTERS);
-      setLoading(false);
-    }, 300);
-  }, []);
+    const fetchComputers = async () => {
+      try {
+        setLoading(true);
+        setError(null);
+        const res = await pcsApi.get('/pcs', {
+          params: { status: filterStatus === 'all' ? undefined : filterStatus }
+        });
+        setComputers(res.data);
+      } catch (err) {
+        console.error('❌ Failed to fetch computers:', err);
+        setError('Не удалось загрузить список компьютеров');
+      } finally {
+        setLoading(false);
+      }
+    };
 
-  // Фильтрация
+    fetchComputers();
+  }, [filterStatus]);
+
+  // Фильтрация на фронтенде (по этажу)
   const filteredComputers = computers.filter(pc => {
     const floorMatch = filterFloor === 'all' || pc.floor === parseInt(filterFloor);
-    const statusMatch = filterStatus === 'all' || pc.status === filterStatus;
-    return floorMatch && statusMatch;
+    return floorMatch;
   });
 
-  // Обработка бронирования
-  const handleBook = () => {
+  // ✅ Обработка бронирования (через booking-service, порт 3003)
+  const handleBook = async () => {
     if (!selectedPc || !bookingTime.start || !bookingTime.end) {
       alert('Выберите компьютер и время');
       return;
     }
+
+    const startDate = new Date(bookingTime.start);
+    const endDate = new Date(bookingTime.end);
     
-    // 🔧 Здесь будет API-запрос: api.post('/bookings', { ... })
-    alert(`✅ Бронь создана!\nКомпьютер: ${selectedPc.serial_number}\nВремя: ${bookingTime.start} - ${bookingTime.end}`);
-    
-    // Сброс формы
-    setSelectedPc(null);
-    setBookingTime({ start: '', end: '' });
-    
-    // Переход к моим броням
-    navigate('/user/bookings');
+    if (endDate <= startDate) {
+      alert('Время окончания должно быть позже времени начала');
+      return;
+    }
+
+    try {
+      setBookingLoading(true);
+      
+      // ✅ Запрос на ПРАВИЛЬНЫЙ порт (3003) через bookingsApi
+      const response = await bookingsApi.post('/bookings', {
+        computer_id: selectedPc.computer_id,
+        start_time: startDate.toISOString(),
+        end_time: endDate.toISOString(),
+        purpose: 'Бронь через пользовательский интерфейс',
+        booking_type: 'standard'
+      });
+
+      alert(`✅ Бронь создана!\nID: ${response.data.booking_id}\nКомпьютер: ${selectedPc.serial_number}`);
+      
+      setSelectedPc(null);
+      setBookingTime({ start: '', end: '' });
+      
+      // Обновляем статус компьютера в списке
+      setComputers(prev => prev.map(pc => 
+        pc.computer_id === selectedPc.computer_id 
+          ? { ...pc, status: 'booked' } 
+          : pc
+      ));
+      
+      navigate('/user/bookings');
+      
+    } catch (err) {
+      console.error('❌ Booking error:', err);
+      const msg = err.response?.data?.error || 'Не удалось создать бронь';
+      alert(`❌ Ошибка: ${msg}`);
+    } finally {
+      setBookingLoading(false);
+    }
   };
 
   const getStatusBadge = (status) => {
@@ -64,10 +192,15 @@ export default function UserHome() {
       maintenance: { bg: '#fee2e2', color: '#991b1b', text: 'Ремонт' },
     };
     const s = styles[status] || styles.maintenance;
-    return <span style={{ padding: '4px 10px', borderRadius: 6, fontSize: '0.8rem', fontWeight: 600, background: s.bg, color: s.color }}>{s.text}</span>;
+    return (
+      <span style={{ padding: '4px 10px', borderRadius: 6, fontSize: '0.8rem', fontWeight: 600, background: s.bg, color: s.color }}>
+        {s.text}
+      </span>
+    );
   };
 
   if (loading) return <div style={{ padding: 40, textAlign: 'center' }}>Загрузка компьютеров...</div>;
+  if (error) return <div style={{ padding: 40, textAlign: 'center', color: '#dc2626' }}>❌ {error}<br/><button onClick={() => window.location.reload()} style={{marginTop: 12, padding: '8px 16px', background: '#3b82f6', color: 'white', border: 'none', borderRadius: 6, cursor: 'pointer'}}>🔄 Повторить</button></div>;
 
   return (
     <div>
@@ -79,21 +212,28 @@ export default function UserHome() {
 
       {/* 🔍 Фильтры */}
       <div style={{ display: 'flex', gap: 12, marginBottom: 24, flexWrap: 'wrap' }}>
-        <select value={filterFloor} onChange={e => setFilterFloor(e.target.value)} style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1' }}>
+        <select value={filterFloor} onChange={e => setFilterFloor(e.target.value)} style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1', background: 'white' }}>
           <option value="all">Все этажи</option>
           <option value="1">1 этаж</option>
           <option value="2">2 этаж</option>
           <option value="3">3 этаж</option>
         </select>
-        <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)} style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1' }}>
+        <select value={filterStatus} onChange={e => { setFilterStatus(e.target.value); setFilterFloor('all'); }} style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1', background: 'white' }}>
           <option value="available">Только свободные</option>
           <option value="all">Все статусы</option>
         </select>
+        <button onClick={() => { setFilterFloor('all'); setFilterStatus('available'); }} style={{ padding: '8px 16px', background: '#64748b', color: 'white', border: 'none', borderRadius: 6, cursor: 'pointer' }}>
+          🔄 Сбросить
+        </button>
       </div>
 
       {/* 💻 Сетка компьютеров */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 16, marginBottom: 32 }}>
-        {filteredComputers.map(pc => (
+        {filteredComputers.length === 0 ? (
+          <div style={{ gridColumn: '1/-1', textAlign: 'center', padding: 40, color: '#64748b' }}>
+            Нет компьютеров по выбранным фильтрам
+          </div>
+        ) : filteredComputers.map(pc => (
           <div 
             key={pc.computer_id}
             onClick={() => pc.status === 'available' && setSelectedPc(pc)}
@@ -105,12 +245,18 @@ export default function UserHome() {
               cursor: pc.status === 'available' ? 'pointer' : 'not-allowed',
               opacity: pc.status !== 'available' ? 0.7 : 1,
               transition: 'all 0.2s',
-              boxShadow: selectedPc?.computer_id === pc.computer_id ? '0 0 0 3px rgba(59, 130, 246, 0.3)' : '0 1px 3px rgba(0,0,0,0.1)'
+              boxShadow: selectedPc?.computer_id === pc.computer_id ? '0 0 0 3px rgba(59, 130, 246, 0.3)' : '0 1px 3px rgba(0,0,0,0.1)',
+              position: 'relative'
             }}
             onMouseOver={e => { if(pc.status === 'available') e.currentTarget.style.borderColor = '#94a3b8'; }}
             onMouseOut={e => { if(pc.status === 'available' && selectedPc?.computer_id !== pc.computer_id) e.currentTarget.style.borderColor = '#e2e8f0'; }}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', marginBottom: 12 }}>
+            {/* ❤️ Кнопка избранного */}
+            <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 1 }}>
+              <HeartButton computer_id={pc.computer_id} />
+            </div>
+            
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', marginBottom: 12, paddingRight: 24 }}>
               <div>
                 <h3 style={{ margin: '0 0 4px', fontSize: '1.1rem' }}>{pc.serial_number}</h3>
                 <p style={{ margin: 0, color: '#64748b', fontSize: '0.9rem' }}>Этаж {pc.floor}, комната {pc.room}</p>
@@ -119,14 +265,15 @@ export default function UserHome() {
             </div>
             
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, fontSize: '0.85rem', color: '#475569', marginBottom: 12 }}>
-              <div><strong>CPU:</strong> {pc.config?.cpu}</div>
-              <div><strong>RAM:</strong> {pc.config?.ram}</div>
-              <div><strong>GPU:</strong> {pc.config?.gpu}</div>
+              <div><strong>CPU:</strong> {pc.config?.cpu || '—'}</div>
+              <div><strong>RAM:</strong> {pc.config?.ram_gb ? `${pc.config.ram_gb}GB` : '—'}</div>
+              <div><strong>GPU:</strong> {pc.config?.gpu || '—'}</div>
+              <div><strong>OS:</strong> {pc.config?.os || '—'}</div>
             </div>
             
             {pc.status === 'available' && (
               <button style={{
-                width: '100%', padding: 8, background: '#3b82f6', color: 'white',
+                width: '100%', padding: 8, background: selectedPc?.computer_id === pc.computer_id ? '#2563eb' : '#3b82f6', color: 'white',
                 border: 'none', borderRadius: 6, cursor: 'pointer', fontWeight: 500
               }}>
                 {selectedPc?.computer_id === pc.computer_id ? '✓ Выбран' : 'Забронировать'}
@@ -136,11 +283,11 @@ export default function UserHome() {
         ))}
       </div>
 
-      {/* 📅 Форма бронирования (появляется при выборе ПК) */}
+      {/* 📅 Форма бронирования */}
       {selectedPc && (
         <div style={{
           background: 'white', borderRadius: 12, padding: 20, border: '1px solid #e2e8f0',
-          position: 'sticky', bottom: 20, boxShadow: '0 -4px 20px rgba(0,0,0,0.1)'
+          position: 'sticky', bottom: 20, boxShadow: '0 -4px 20px rgba(0,0,0,0.1)', zIndex: 10
         }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
             <h3 style={{ margin: 0 }}>📅 Бронь: <strong>{selectedPc.serial_number}</strong></h3>
@@ -150,17 +297,34 @@ export default function UserHome() {
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', alignItems: 'end' }}>
             <div>
               <label style={{ display: 'block', marginBottom: 4, fontSize: '0.9rem', color: '#475569' }}>Начало</label>
-              <input type="datetime-local" value={bookingTime.start} onChange={e => setBookingTime(prev => ({ ...prev, start: e.target.value }))} style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1' }} />
+              <input 
+                type="datetime-local" 
+                value={bookingTime.start} 
+                onChange={e => setBookingTime(prev => ({ ...prev, start: e.target.value }))} 
+                style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1' }}
+                min={new Date().toISOString().slice(0, 16)}
+              />
             </div>
             <div>
               <label style={{ display: 'block', marginBottom: 4, fontSize: '0.9rem', color: '#475569' }}>Конец</label>
-              <input type="datetime-local" value={bookingTime.end} onChange={e => setBookingTime(prev => ({ ...prev, end: e.target.value }))} style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1' }} />
+              <input 
+                type="datetime-local" 
+                value={bookingTime.end} 
+                onChange={e => setBookingTime(prev => ({ ...prev, end: e.target.value }))} 
+                style={{ padding: '8px 12px', borderRadius: 6, border: '1px solid #cbd5e1' }}
+                min={bookingTime.start || new Date().toISOString().slice(0, 16)}
+              />
             </div>
-            <button onClick={handleBook} style={{
-              padding: '10px 24px', background: '#10b981', color: 'white', border: 'none',
-              borderRadius: 8, cursor: 'pointer', fontWeight: 600, fontSize: '1rem'
-            }}>
-              ✅ Подтвердить бронь
+            <button 
+              onClick={handleBook} 
+              disabled={bookingLoading}
+              style={{
+                padding: '10px 24px', background: bookingLoading ? '#94a3b8' : '#10b981', color: 'white', border: 'none',
+                borderRadius: 8, cursor: bookingLoading ? 'not-allowed' : 'pointer', fontWeight: 600, fontSize: '1rem',
+                display: 'flex', alignItems: 'center', gap: 8
+              }}
+            >
+              {bookingLoading ? '⏳ Создаём...' : '✅ Подтвердить бронь'}
             </button>
           </div>
         </div>
